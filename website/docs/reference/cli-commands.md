@@ -1076,10 +1076,9 @@ Manage profiles — multiple isolated Hermes instances, each with its own config
 | `show <name>` | Show profile details (home directory, config, etc.). |
 | `alias <name> [--remove] [--name NAME]` | Manage wrapper scripts for quick profile access. |
 | `rename <old> <new>` | Rename a profile. |
-| `export <name> [-o FILE]` | Export a profile to a `.tar.gz` archive. |
-| `import <archive> [--name NAME]` | Import a profile from a `.tar.gz` archive. |
-| `pack <name> [-o FILE]` | Pack a profile as a shareable distribution (tar.gz + manifest). |
-| `install <source> [--name N] [--alias] [--force] [-y]` | Install a distribution from a local archive, directory, URL, or git repo. |
+| `export <name> [-o FILE]` | Export a profile to a `.tar.gz` archive (local backup). |
+| `import <archive> [--name NAME]` | Import a profile from a `.tar.gz` archive (local restore). |
+| `install <source> [--name N] [--alias] [--force] [-y]` | Install a profile distribution from a git URL or local directory. |
 | `update <name> [--force-config] [-y]` | Re-pull a distribution; preserves user data (memories, sessions, auth). |
 | `info <name>` | Show a profile's distribution manifest (version, requirements, source). |
 
@@ -1092,7 +1091,6 @@ hermes profile use work
 hermes profile alias work --name h-work
 hermes profile export work -o work-backup.tar.gz
 hermes profile import work-backup.tar.gz --name restored
-hermes profile pack work
 hermes profile install github.com/user/my-distro --alias
 hermes profile update work
 hermes -p work chat -q "Hello from work profile"

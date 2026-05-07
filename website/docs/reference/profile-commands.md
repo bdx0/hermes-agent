@@ -245,34 +245,24 @@ hermes profile import ./work-2026-03-29.tar.gz --name work-restored
 
 ## Distribution commands
 
-Distributions turn a profile into a shareable, versioned artifact — SOUL.md,
-config, skills, cron jobs, and an environment-variable manifest packaged into
-a single tar.gz. Credentials (`auth.json`, `.env`) are never included.
+Distributions turn a profile into a shareable, versioned artifact published
+as a **git repository**. A recipient installs the distribution with a single
+command and can update it in place later without touching their local
+memories, sessions, or credentials.
 
-The recipient installs the distribution into a new profile; their user data
-(memories, sessions, auth) is preserved across subsequent updates.
+`auth.json` and `.env` are never part of a distribution — they stay on the
+installing user's machine.
 
-### `hermes profile pack`
+The recipient's user data (memories, sessions, auth, their own edits to
+`.env`) is always preserved across the initial install and subsequent
+updates.
 
-```bash
-hermes profile pack <name> [-o <output.tar.gz>]
-```
-
-Packs a profile's distribution-owned files (SOUL.md, config.yaml, skills/,
-cron/, mcp.json, distribution.yaml) plus a generated `.env.template`.
-
-If the profile contains a `distribution.yaml`, it is used as-is. Otherwise
-a minimal manifest is synthesized — edit it before packing to add
-`version`, `description`, `env_requires`, etc.
-
-**Examples:**
-
-```bash
-hermes profile pack telemetry
-# Writes telemetry-0.1.0.tar.gz in the current directory
-
-hermes profile pack telemetry -o ~/releases/telemetry-1.0.tar.gz
-```
+:::info
+`hermes profile export` / `import` are still the right commands for
+**local backup and restore** of a profile on your own machine. Distribution
+(`install` / `update` / `info`) is a separate concept: ship a profile via
+git so someone else can install it.
+:::
 
 ### `hermes profile install`
 
@@ -280,12 +270,11 @@ hermes profile pack telemetry -o ~/releases/telemetry-1.0.tar.gz
 hermes profile install <source> [--name <name>] [--alias] [--force] [--yes]
 ```
 
-Installs a distribution from a local archive, local directory, HTTP(S)
-tar.gz URL, or git repository URL.
+Installs a profile distribution from a git URL or a local directory.
 
 | Option | Description |
 |--------|-------------|
-| `<source>` | `.tar.gz` path, directory, `https://...tar.gz`, or git URL (`github.com/user/repo`, `https://...`, `git@...`). |
+| `<source>` | Git URL (`github.com/user/repo`, `https://...`, `git@...`, `ssh://`, `git://`) or a local directory containing `distribution.yaml` at its root. |
 | `--name NAME` | Override the profile name from the manifest. |
 | `--alias` | Also create a shell wrapper (e.g. `telemetry` → `hermes -p telemetry`). |
 | `--force` | Overwrite an existing profile of the same name. User data is still preserved. |
@@ -298,9 +287,17 @@ cron jobs before asking for confirmation. Required env vars go into a
 **Examples:**
 
 ```bash
-hermes profile install ./telemetry-1.0.tar.gz
-hermes profile install https://example.com/dist/telemetry.tar.gz --yes
+# Install from a GitHub repo (shorthand)
 hermes profile install github.com/kyle/telemetry-distribution --alias
+
+# Install from a full HTTPS git URL
+hermes profile install https://github.com/kyle/telemetry-distribution.git
+
+# Install from SSH
+hermes profile install git@github.com:kyle/telemetry-distribution.git
+
+# Install from a local directory during development
+hermes profile install ./telemetry/
 ```
 
 ### `hermes profile update`
@@ -309,7 +306,7 @@ hermes profile install github.com/kyle/telemetry-distribution --alias
 hermes profile update <name> [--force-config] [--yes]
 ```
 
-Re-pulls the distribution from its recorded source and applies updates.
+Re-clones the distribution from its recorded source and applies updates.
 Distribution-owned files (SOUL.md, skills/, cron/, mcp.json) are
 overwritten; user data (memories, sessions, auth, .env) is never touched.
 
@@ -328,7 +325,7 @@ Useful for checking what a shared profile needs before installing it.
 
 ### Distribution manifest (`distribution.yaml`)
 
-The manifest lives at the profile root and describes the distribution:
+Every distribution has a `distribution.yaml` at the root of its repository:
 
 ```yaml
 name: telemetry
@@ -356,9 +353,22 @@ distribution_owned:   # optional; defaults to SOUL.md, config.yaml,
 version (treated as `>=`). Install fails with a clear error if the current
 Hermes version doesn't satisfy the spec.
 
-`distribution_owned` is optional. If set, only those paths are packed and
-replaced on update; anything else in the profile stays user-owned. If
-omitted, the defaults above apply.
+`distribution_owned` is optional. If set, only those paths are replaced on
+update; anything else in the profile stays user-owned. If omitted, the
+defaults above apply.
+
+### Publishing a distribution
+
+Authoring a distribution is just a git push:
+
+1. In your profile directory, create `distribution.yaml` with at least `name`
+   and `version`.
+2. Initialize a git repo (or use an existing one) and push to GitHub /
+   GitLab / any host Hermes can clone from.
+3. Tell recipients to run `hermes profile install <your-repo-url>`.
+
+Use git tags for versioned releases — recipients who clone `HEAD` get your
+latest state, and you can always bump `version:` in the manifest.
 
 ## `hermes -p` / `hermes --profile`
 

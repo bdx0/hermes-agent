@@ -8337,33 +8337,6 @@ def cmd_profile(args):
             print(f"Error: {e}")
             sys.exit(1)
 
-    elif action == "pack":
-        from hermes_cli.profile_distribution import (
-            pack_profile,
-            read_manifest,
-            DistributionManifest,
-            DistributionError,
-        )
-        from hermes_cli.profiles import get_profile_dir, normalize_profile_name
-
-        name = args.profile_name
-        try:
-            canon = normalize_profile_name(name)
-            manifest = read_manifest(get_profile_dir(canon)) or DistributionManifest(name=canon)
-            version = manifest.version or "0.1.0"
-            output = args.output or f"{canon}-{version}.tar.gz"
-            result = pack_profile(name, output)
-            print(f"✓ Packed '{canon}' (v{version}) → {result}")
-            print(f"  Install with:  hermes profile install {result}")
-            if not manifest.env_requires and (get_profile_dir(canon) / "distribution.yaml").is_file() is False:
-                print(
-                    "\n  Tip: edit distribution.yaml in the profile to add "
-                    "env_requires/author/description before packing."
-                )
-        except (DistributionError, ValueError, FileNotFoundError) as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-
     elif action == "install":
         import tempfile
         from hermes_cli.profile_distribution import (
@@ -10765,33 +10738,18 @@ Examples:
     )
 
     # ---------- Distribution subcommands (issue #20456) ----------
-    profile_pack = profile_subparsers.add_parser(
-        "pack",
-        help="Pack a profile as a shareable distribution archive",
-        description=(
-            "Bundle a profile's distribution-owned files (SOUL.md, config.yaml, "
-            "skills/, cron/, mcp.json, distribution.yaml) into a tar.gz that "
-            "others can install via `hermes profile install`."
-        ),
-    )
-    profile_pack.add_argument("profile_name", help="Profile to pack")
-    profile_pack.add_argument(
-        "-o", "--output", default=None,
-        help="Output file (default: <name>-<version>.tar.gz)",
-    )
-
     profile_install = profile_subparsers.add_parser(
         "install",
-        help="Install a profile from a distribution archive, directory, URL, or git repo",
+        help="Install a profile distribution from a git URL or local directory",
         description=(
-            "Install a Hermes distribution. SOURCE can be a local .tar.gz, a "
-            "local directory, an HTTP(S) URL pointing to a .tar.gz, or a git "
-            "repository URL (github.com/user/repo, https://..., git@...)."
+            "Install a Hermes profile distribution. SOURCE can be a git URL "
+            "(github.com/user/repo, https://..., git@...) or a local "
+            "directory containing distribution.yaml at its root."
         ),
     )
     profile_install.add_argument(
         "source",
-        help="Distribution source (.tar.gz, directory, URL, or git repo)",
+        help="Distribution source (git URL or local directory)",
     )
     profile_install.add_argument(
         "--name", dest="install_name", metavar="NAME",

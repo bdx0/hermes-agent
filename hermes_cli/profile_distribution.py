@@ -1,22 +1,30 @@
-"""Profile distributions — packaged, shareable Hermes profiles.
+"""Profile distributions — shareable, packaged Hermes profiles via git.
 
-A distribution is a packaged profile that can be installed with a single
-command from a local path, tar.gz archive, HTTP(S) URL, or git repository.
+A distribution is a Hermes profile published as a git repository (or
+installed from a local directory for development). Install with one command
+from a git URL, update in place, and keep your local memories / sessions /
+credentials untouched.
 
 Where this fits relative to the existing pieces:
 
-* ``hermes profile export/import`` — already ships a profile as a tar.gz.
-  Distributions extend this with a manifest, URL/git install, version pin,
-  env-var onboarding, and update semantics that preserve user data.
-* ``hermes skills install <url>`` — proves the URL install pattern is
-  welcome; we reuse that convention (httpx, stdlib tarfile) here.
+* ``hermes profile export/import`` — local backup / restore for a profile
+  on your own machine. NOT a distribution format. Stays as-is.
+* ``hermes skills install <url>`` — the URL install pattern we're mirroring,
+  but at the profile granularity.
 
 Subcommands (all live under ``hermes profile``, not a parallel tree):
 
-    hermes profile pack    <name> [-o dist.tar.gz]
     hermes profile install <source> [--name N] [--alias] [--force] [--yes]
     hermes profile update  <name>  [--force-config] [--yes]
     hermes profile info    <name>
+
+``<source>`` is one of:
+
+* A git URL (``github.com/user/repo``, ``https://github.com/...``, ``git@...``,
+  ``ssh://``, ``git://``), optionally with ``#<ref>`` to pin a tag / branch /
+  commit SHA.
+* A local directory that already contains ``distribution.yaml`` — used
+  during profile development before the first push.
 
 Manifest format (``distribution.yaml`` at the profile root)::
 
@@ -43,7 +51,7 @@ Manifest format (``distribution.yaml`` at the profile root)::
 Update semantics:
 
 * Distribution-owned paths (SOUL.md, mcp.json, skills/, cron/,
-  distribution.yaml) are replaced from the new archive.
+  distribution.yaml) are replaced from the new source.
 * ``config.yaml`` is distribution-owned but preserved on update unless
   ``--force-config`` is passed (user overrides typically live here).
 * User-owned paths (memories/, sessions/, state.db, auth.json, .env,
@@ -53,17 +61,13 @@ Update semantics:
 
 from __future__ import annotations
 
-import io
-import os
 import re
 import shutil
 import subprocess
-import tarfile
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 
 # ---------------------------------------------------------------------------
@@ -86,10 +90,10 @@ DEFAULT_DIST_OWNED: Tuple[str, ...] = (
     MANIFEST_FILENAME,
 )
 
-# Paths that are NEVER part of a distribution.  These are user-owned and are
-# stripped from archives on pack, and protected on update.  Must stay
-# consistent with ``profiles.py::_DEFAULT_EXPORT_EXCLUDE_ROOT`` plus the
-# ``local/`` convention for user customizations.
+# Paths that are NEVER part of a distribution. These are user-owned and are
+# protected on update. Must stay consistent with
+# ``profiles.py::_DEFAULT_EXPORT_EXCLUDE_ROOT`` plus the ``local/``
+# convention for user customizations.
 USER_OWNED_EXCLUDE: frozenset = frozenset({
     # Credentials & runtime secrets
     "auth.json", ".env",
@@ -118,7 +122,7 @@ USER_OWNED_EXCLUDE: frozenset = frozenset({
 
 
 class DistributionError(Exception):
-    """Raised for distribution install/pack/update failures."""
+    """Raised for distribution install/update failures."""
 
 
 # ---------------------------------------------------------------------------
@@ -314,57 +318,7 @@ def check_hermes_requires(spec: str, current_version: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Archive helpers — safe tar extraction, shared with profiles.py patterns
-# ---------------------------------------------------------------------------
-
-
-def _safe_parts(member_name: str) -> List[str]:
-    normalized = member_name.replace("\\", "/")
-    posix = PurePosixPath(normalized)
-    win = PureWindowsPath(member_name)
-    if not normalized or posix.is_absolute() or win.is_absolute() or win.drive:
-        raise DistributionError(f"Unsafe archive member path: {member_name}")
-    parts = [p for p in posix.parts if p not in ("", ".")]
-    if not parts or any(p == ".." for p in parts):
-        raise DistributionError(f"Unsafe archive member path: {member_name}")
-    return parts
-
-
-def _archive_roots(archive: Path) -> List[str]:
-    roots: set = set()
-    with tarfile.open(archive, "r:gz") as tf:
-        for member in tf.getmembers():
-            parts = _safe_parts(member.name)
-            roots.add(parts[0])
-    return sorted(roots)
-
-
-def _safe_extract(archive: Path, destination: Path) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive, "r:gz") as tf:
-        for member in tf.getmembers():
-            parts = _safe_parts(member.name)
-            target = destination.joinpath(*parts)
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            if not member.isfile():
-                # Skip symlinks, devices, etc. — never trust them.
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            extracted = tf.extractfile(member)
-            if extracted is None:
-                continue
-            with extracted, open(target, "wb") as dst:
-                shutil.copyfileobj(extracted, dst)
-            try:
-                os.chmod(target, member.mode & 0o777)
-            except OSError:
-                pass
-
-
-# ---------------------------------------------------------------------------
-# Pack — create a distribution tar.gz from an existing profile
+# Env var template helper
 # ---------------------------------------------------------------------------
 
 
@@ -387,74 +341,8 @@ def _env_template_from_manifest(manifest: DistributionManifest) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def pack_profile(
-    profile_name: str,
-    output_path: str,
-    manifest: Optional[DistributionManifest] = None,
-) -> Path:
-    """Pack *profile_name* into a distribution tar.gz.
-
-    If the profile already has a ``distribution.yaml``, it's used unless
-    *manifest* is supplied (explicit override).  Otherwise a minimal
-    manifest is generated from the profile name with default version 0.1.0 —
-    authors should edit the packed archive or pass a richer manifest.
-    """
-    from hermes_cli.profiles import (
-        get_profile_dir,
-        normalize_profile_name,
-        validate_profile_name,
-    )
-
-    canon = normalize_profile_name(profile_name)
-    validate_profile_name(canon)
-    profile_dir = get_profile_dir(canon)
-    if not profile_dir.is_dir():
-        raise DistributionError(f"Profile '{canon}' does not exist.")
-
-    # Resolve manifest: explicit > on-disk > synthesized
-    if manifest is None:
-        manifest = read_manifest(profile_dir) or DistributionManifest(name=canon)
-
-    # Never embed the live source path in the packed artifact — it's user-local.
-    manifest.source = ""
-
-    out = Path(output_path)
-    base = str(out).removesuffix(".tar.gz").removesuffix(".tgz")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        staging = Path(tmp) / manifest.name
-        staging.mkdir(parents=True)
-
-        # Copy distribution-owned files only; skip user-owned + excludes
-        for entry in profile_dir.iterdir():
-            if entry.name in USER_OWNED_EXCLUDE:
-                continue
-            if entry.name == MANIFEST_FILENAME:
-                continue  # we'll write a fresh one below
-            if entry.is_dir():
-                shutil.copytree(
-                    entry,
-                    staging / entry.name,
-                    ignore=lambda d, names: [n for n in names if n in USER_OWNED_EXCLUDE],
-                )
-            else:
-                shutil.copy2(entry, staging / entry.name)
-
-        # Write the manifest and a fresh .env.template derived from it.
-        (staging / MANIFEST_FILENAME).write_text(
-            _dump_yaml(manifest.to_dict()), encoding="utf-8"
-        )
-        if manifest.env_requires:
-            (staging / ENV_TEMPLATE_FILENAME).write_text(
-                _env_template_from_manifest(manifest), encoding="utf-8"
-            )
-
-        result = shutil.make_archive(base, "gztar", str(staging.parent), manifest.name)
-        return Path(result)
-
-
 # ---------------------------------------------------------------------------
-# Source resolution — local path, URL, or git repo → staged directory
+# Source staging — git clone or local directory
 # ---------------------------------------------------------------------------
 
 
@@ -464,25 +352,14 @@ def _looks_like_git_url(s: str) -> bool:
         return True
     if s.startswith(("git@", "ssh://", "git://")):
         return True
+    if s.startswith(("http://", "https://")):
+        # Any http(s) URL is treated as a git repo.  We no longer accept
+        # tar.gz URLs — git is the only remote transport.
+        return True
     # Bare github.com/user/repo shorthand
     if re.match(r"^github\.com/[\w.-]+/[\w.-]+/?$", s):
         return True
     return False
-
-
-def _http_fetch(url: str, dest: Path) -> None:
-    try:
-        import httpx
-    except ImportError as exc:  # pragma: no cover
-        raise DistributionError("httpx is required for URL installs") from exc
-    try:
-        with httpx.stream("GET", url, timeout=60.0, follow_redirects=True) as resp:
-            resp.raise_for_status()
-            with open(dest, "wb") as f:
-                for chunk in resp.iter_bytes():
-                    f.write(chunk)
-    except httpx.HTTPError as exc:
-        raise DistributionError(f"Failed to download {url}: {exc}") from exc
 
 
 def _git_clone(url: str, dest: Path) -> None:
@@ -503,86 +380,45 @@ def _git_clone(url: str, dest: Path) -> None:
 
 
 def _stage_source(source: str, workdir: Path) -> Tuple[Path, str]:
-    """Resolve *source* to a local directory containing the distribution files.
+    """Resolve *source* to a local directory containing distribution.yaml.
 
     Returns ``(staged_dir, provenance)`` where ``provenance`` is stored in the
     installed manifest's ``source:`` field so ``hermes profile update`` can
     re-pull from the same place.
+
+    Accepts:
+      * A git URL (https / ssh / git@ / bare github.com shorthand) — cloned
+        into a temp directory; ``.git`` removed after clone.
+      * A local directory already containing ``distribution.yaml``.
     """
     src_str = source.strip()
 
-    # 1. Local .tar.gz / .tgz archive
-    path_guess = Path(src_str).expanduser()
-    if path_guess.is_file() and src_str.lower().endswith((".tar.gz", ".tgz")):
-        staged = workdir / "extracted"
-        _safe_extract(path_guess, staged)
-        return _find_dist_root(staged), str(path_guess.resolve())
-
-    # 2. Local directory
-    if path_guess.is_dir():
-        return path_guess.resolve(), str(path_guess.resolve())
-
-    # 3. HTTP(S) — must be a tar.gz
-    if src_str.lower().startswith(("http://", "https://")):
-        parsed = urlparse(src_str)
-        path_lower = parsed.path.lower()
-        if path_lower.endswith((".tar.gz", ".tgz")):
-            archive = workdir / "download.tar.gz"
-            _http_fetch(src_str, archive)
-            staged = workdir / "extracted"
-            _safe_extract(archive, staged)
-            return _find_dist_root(staged), src_str
-        # Treat as git repo URL otherwise (github.com/user/repo etc.)
-        if _looks_like_git_url(src_str) or "github.com" in parsed.netloc:
-            cloned = workdir / "clone"
-            _git_clone(src_str, cloned)
-            # Remove .git to keep the staged tree clean
-            shutil.rmtree(cloned / ".git", ignore_errors=True)
-            return cloned, src_str
-        raise DistributionError(
-            f"Don't know how to install from {src_str!r}. "
-            "Use a .tar.gz URL or a git repository URL."
-        )
-
-    # 4. git@ / ssh:// / git:// / bare github shorthand
+    # Git URL
     if _looks_like_git_url(src_str):
         cloned = workdir / "clone"
         _git_clone(src_str, cloned)
+        # Remove .git to keep the staged tree clean
         shutil.rmtree(cloned / ".git", ignore_errors=True)
+        if not (cloned / MANIFEST_FILENAME).is_file():
+            raise DistributionError(
+                f"No {MANIFEST_FILENAME} at the root of {src_str!r}. "
+                "This repository is not a Hermes profile distribution."
+            )
         return cloned, src_str
 
-    raise DistributionError(f"Cannot resolve distribution source: {source!r}")
+    # Local directory
+    path_guess = Path(src_str).expanduser()
+    if path_guess.is_dir():
+        if not (path_guess / MANIFEST_FILENAME).is_file():
+            raise DistributionError(
+                f"No {MANIFEST_FILENAME} in {path_guess}. "
+                "A local-directory source must contain a distribution.yaml at its root."
+            )
+        return path_guess.resolve(), str(path_guess.resolve())
 
-
-def _find_dist_root(staged: Path) -> Path:
-    """Locate the directory containing ``distribution.yaml`` within *staged*.
-
-    Resolution order:
-
-    1. ``staged/distribution.yaml`` → return *staged*.
-    2. Exactly one child subdirectory containing a manifest → return that.
-       (This is the normal tar.gz layout: ``archive.tar.gz`` unpacks to
-       ``./<name>/distribution.yaml``.)
-    3. Any single subdirectory contains a manifest and no other subdir does
-       → return the one that contains it.  Covers tempdirs that might have
-       sibling noise (caches, test fixtures) alongside the real payload.
-
-    Otherwise raise :class:`DistributionError`.
-    """
-    if (staged / MANIFEST_FILENAME).is_file():
-        return staged
-    subdirs = [c for c in staged.iterdir() if c.is_dir()]
-    with_manifest = [d for d in subdirs if (d / MANIFEST_FILENAME).is_file()]
-    if len(with_manifest) == 1:
-        return with_manifest[0]
-    if len(with_manifest) > 1:
-        raise DistributionError(
-            f"Ambiguous distribution source: {MANIFEST_FILENAME} found in "
-            f"multiple directories ({', '.join(d.name for d in with_manifest)})."
-        )
     raise DistributionError(
-        f"No {MANIFEST_FILENAME} found in distribution source. "
-        "Distributions must include a manifest at the root."
+        f"Cannot resolve distribution source: {source!r}. "
+        "Expected a git URL (e.g. github.com/user/repo) or a local directory."
     )
 
 
@@ -714,6 +550,12 @@ def _copy_dist_payload(
             )
         else:
             shutil.copy2(entry, dest)
+
+    # Emit .env.EXAMPLE from manifest if the staged tree didn't ship one
+    if manifest.env_requires and not (target / ENV_EXAMPLE_FILENAME).exists():
+        (target / ENV_EXAMPLE_FILENAME).write_text(
+            _env_template_from_manifest(manifest), encoding="utf-8"
+        )
 
     # Make sure the manifest on disk reflects resolved name + source
     write_manifest(target, manifest)

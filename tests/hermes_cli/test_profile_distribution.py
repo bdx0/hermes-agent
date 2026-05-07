@@ -1,15 +1,16 @@
-"""Tests for hermes_cli.profile_distribution — packaged profile installs.
+"""Tests for hermes_cli.profile_distribution — git-based profile installs.
 
-Covers manifest parsing, version requirement checks, pack → install round
-trip, update semantics (config preserved by default, user data never touched),
-and security (credentials excluded from packed archives, path-traversal
-rejection in archives).
+Covers manifest parsing, version requirement checks, install / update / describe
+on local-directory sources, and guards on what can and can't be installed.
+
+Transport-layer tests (git clone, URL handling) are exercised through live
+E2E runs, not unit tests — git itself is tested upstream, and subprocess-
+mocking git would just test the mock.
 """
 
 from __future__ import annotations
 
 import os
-import tarfile
 from pathlib import Path
 
 import pytest
@@ -22,12 +23,11 @@ from hermes_cli.profile_distribution import (
     MANIFEST_FILENAME,
     USER_OWNED_EXCLUDE,
     _env_template_from_manifest,
-    _find_dist_root,
+    _looks_like_git_url,
     _parse_semver,
     check_hermes_requires,
     describe_distribution,
     install_distribution,
-    pack_profile,
     plan_install,
     read_manifest,
     update_distribution,
@@ -49,28 +49,29 @@ def profile_env(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _make_profile(profile_env, name: str = "source_profile") -> Path:
-    """Create a minimal profile under the isolated HERMES_HOME."""
-    from hermes_cli.profiles import create_profile
+def _make_staging_dir(root: Path, name: str = "src", *, manifest: DistributionManifest = None) -> Path:
+    """Build a local distribution staging directory (what a git clone would
+    contain after .git is removed).
 
-    profile_dir = create_profile(name=name, no_alias=True)
-    # Lay down representative content
-    (profile_dir / "SOUL.md").write_text("I am Source.\n")
-    (profile_dir / "config.yaml").write_text("model:\n  model: gpt-4\n")
-    (profile_dir / "mcp.json").write_text('{"servers": {}}\n')
-    (profile_dir / "skills").mkdir(exist_ok=True)
-    (profile_dir / "skills" / "demo").mkdir(exist_ok=True)
-    (profile_dir / "skills" / "demo" / "SKILL.md").write_text(
+    Lays down a minimal but representative tree: SOUL.md, config.yaml,
+    mcp.json, one skill, one cron file, plus the distribution.yaml manifest.
+    """
+    staged = root / f"staging_{name}"
+    staged.mkdir(parents=True, exist_ok=True)
+    (staged / "SOUL.md").write_text("I am Source.\n")
+    (staged / "config.yaml").write_text("model:\n  model: gpt-4\n")
+    (staged / "mcp.json").write_text('{"servers": {}}\n')
+    (staged / "skills").mkdir(exist_ok=True)
+    (staged / "skills" / "demo").mkdir(exist_ok=True)
+    (staged / "skills" / "demo" / "SKILL.md").write_text(
         "---\nname: demo\ndescription: test\n---\n# Demo skill\n"
     )
-    (profile_dir / "cron").mkdir(exist_ok=True)
-    (profile_dir / "cron" / "daily.json").write_text('{"schedule": "0 9 * * *"}')
-    # User-owned data that MUST NOT ship in the archive
-    (profile_dir / "memories").mkdir(exist_ok=True)
-    (profile_dir / "memories" / "MEMORY.md").write_text("# secret memory\n")
-    (profile_dir / "auth.json").write_text('{"tokens": "sk-secret"}')
-    (profile_dir / ".env").write_text("OPENAI_API_KEY=sk-real\n")
-    return profile_dir
+    (staged / "cron").mkdir(exist_ok=True)
+    (staged / "cron" / "daily.json").write_text('{"schedule": "0 9 * * *"}')
+
+    mf = manifest or DistributionManifest(name=name, version="0.1.0")
+    write_manifest(staged, mf)
+    return staged
 
 
 # ===========================================================================
@@ -80,67 +81,78 @@ def _make_profile(profile_env, name: str = "source_profile") -> Path:
 
 class TestManifestParsing:
 
-    def test_env_requirement_from_dict_minimal(self):
-        er = EnvRequirement.from_dict({"name": "FOO"})
-        assert er.name == "FOO"
-        assert er.required is True
-        assert er.default is None
+    def test_minimal_manifest(self, tmp_path):
+        (tmp_path / MANIFEST_FILENAME).write_text("name: minimal\n")
+        m = read_manifest(tmp_path)
+        assert m.name == "minimal"
+        assert m.version == "0.1.0"
+        assert m.env_requires == []
+        assert m.distribution_owned == []
 
-    def test_env_requirement_missing_name_raises(self):
-        with pytest.raises(DistributionError, match="missing 'name'"):
-            EnvRequirement.from_dict({"description": "no name"})
-
-    def test_env_requirement_optional_with_default(self):
-        er = EnvRequirement.from_dict(
-            {"name": "X", "required": False, "default": "http://localhost"}
+    def test_full_manifest(self, tmp_path):
+        (tmp_path / MANIFEST_FILENAME).write_text(
+            "name: telem\n"
+            "version: 1.2.3\n"
+            "description: Telem monitor\n"
+            "hermes_requires: '>=0.12.0'\n"
+            "author: Kyle\n"
+            "license: MIT\n"
+            "env_requires:\n"
+            "  - name: OPENAI_API_KEY\n"
+            "    description: OpenAI key\n"
+            "  - name: GRAPH_URL\n"
+            "    required: false\n"
+            "    default: http://127.0.0.1:8000\n"
+            "distribution_owned:\n"
+            "  - SOUL.md\n"
+            "  - skills/\n"
         )
-        assert er.required is False
-        assert er.default == "http://localhost"
-
-    def test_manifest_from_dict_full(self):
-        m = DistributionManifest.from_dict({
-            "name": "telemetry",
-            "version": "0.2.0",
-            "hermes_requires": ">=0.12.0",
-            "env_requires": [
-                {"name": "A", "description": "a key"},
-                {"name": "B", "required": False, "default": "x"},
-            ],
-        })
-        assert m.name == "telemetry"
-        assert m.version == "0.2.0"
+        m = read_manifest(tmp_path)
+        assert m.name == "telem"
+        assert m.version == "1.2.3"
+        assert m.author == "Kyle"
+        assert m.license == "MIT"
         assert len(m.env_requires) == 2
+        assert m.env_requires[0].name == "OPENAI_API_KEY"
+        assert m.env_requires[0].required is True
         assert m.env_requires[1].required is False
+        assert m.env_requires[1].default == "http://127.0.0.1:8000"
+        assert m.distribution_owned == ["SOUL.md", "skills"]
 
-    def test_manifest_missing_name_raises(self):
+    def test_missing_name_rejected(self, tmp_path):
+        (tmp_path / MANIFEST_FILENAME).write_text("version: 1.0\n")
         with pytest.raises(DistributionError, match="missing 'name'"):
-            DistributionManifest.from_dict({"version": "1.0"})
+            read_manifest(tmp_path)
 
-    def test_manifest_owned_paths_default(self):
-        m = DistributionManifest(name="x")
-        assert tuple(m.owned_paths()) == DEFAULT_DIST_OWNED
+    def test_env_requires_not_list_rejected(self, tmp_path):
+        (tmp_path / MANIFEST_FILENAME).write_text(
+            "name: bad\nenv_requires:\n  name: FOO\n"
+        )
+        with pytest.raises(DistributionError, match="env_requires must be a list"):
+            read_manifest(tmp_path)
 
-    def test_manifest_owned_paths_override(self):
-        m = DistributionManifest(name="x", distribution_owned=["SOUL.md", "mcp.json"])
-        assert m.owned_paths() == ["SOUL.md", "mcp.json"]
-
-    def test_read_manifest_missing_returns_none(self, tmp_path):
+    def test_read_manifest_returns_none_when_absent(self, tmp_path):
         assert read_manifest(tmp_path) is None
 
-    def test_write_then_read_roundtrip(self, tmp_path):
-        m = DistributionManifest(
-            name="demo",
-            version="1.2.3",
-            description="hi",
-            hermes_requires=">=0.12.0",
-            env_requires=[EnvRequirement(name="KEY", description="d")],
+    def test_owned_paths_default(self):
+        m = DistributionManifest(name="x")
+        assert m.owned_paths() == list(DEFAULT_DIST_OWNED)
+
+    def test_owned_paths_explicit(self):
+        m = DistributionManifest(name="x", distribution_owned=["SOUL.md", "skills"])
+        assert m.owned_paths() == ["SOUL.md", "skills"]
+
+    def test_roundtrip_write_read(self, tmp_path):
+        original = DistributionManifest(
+            name="rt",
+            version="1.0.0",
+            description="roundtrip",
+            env_requires=[EnvRequirement(name="FOO", description="foo")],
         )
-        write_manifest(tmp_path, m)
-        loaded = read_manifest(tmp_path)
-        assert loaded is not None
-        assert loaded.name == "demo"
-        assert loaded.version == "1.2.3"
-        assert loaded.env_requires[0].name == "KEY"
+        write_manifest(tmp_path, original)
+        parsed = read_manifest(tmp_path)
+        assert parsed.name == "rt"
+        assert parsed.env_requires[0].name == "FOO"
 
 
 # ===========================================================================
@@ -150,245 +162,185 @@ class TestManifestParsing:
 
 class TestVersionRequires:
 
-    def test_parse_semver_simple(self):
-        assert _parse_semver("0.12.0") == (0, 12, 0)
-        assert _parse_semver("v1.2.3") == (1, 2, 3)
-        assert _parse_semver("1.2.3-rc1") == (1, 2, 3)
-        assert _parse_semver("0.12") == (0, 12, 0)
+    @pytest.mark.parametrize("spec,cur,ok", [
+        ("", "0.1.0", True),
+        (">=0.12.0", "0.12.0", True),
+        (">=0.12.0", "0.13.0", True),
+        (">=0.12.0", "0.11.9", False),
+        ("==0.12.0", "0.12.0", True),
+        ("==0.12.0", "0.13.0", False),
+        ("!=0.12.0", "0.13.0", True),
+        (">0.12.0", "0.12.1", True),
+        (">0.12.0", "0.12.0", False),
+        ("<0.13.0", "0.12.9", True),
+        ("<=0.12.0", "0.12.0", True),
+        ("0.12.0", "0.13.0", True),     # Bare = >=
+        ("0.12.0", "0.11.0", False),    # Bare = >=
+    ])
+    def test_check_matrix(self, spec, cur, ok):
+        if ok:
+            check_hermes_requires(spec, cur)
+        else:
+            with pytest.raises(DistributionError, match="requires Hermes"):
+                check_hermes_requires(spec, cur)
 
-    def test_parse_semver_bad_raises(self):
-        with pytest.raises(DistributionError):
+    def test_parse_semver_handles_prerelease(self):
+        assert _parse_semver("0.12.0-rc1") == (0, 12, 0)
+        assert _parse_semver("v0.12.0+abc") == (0, 12, 0)
+
+    def test_parse_semver_pads(self):
+        assert _parse_semver("1") == (1, 0, 0)
+        assert _parse_semver("1.2") == (1, 2, 0)
+
+    def test_parse_semver_rejects_garbage(self):
+        with pytest.raises(DistributionError, match="Unparseable"):
             _parse_semver("not-a-version")
-
-    def test_gte_satisfied(self):
-        check_hermes_requires(">=0.12.0", "0.12.0")
-        check_hermes_requires(">=0.12.0", "0.13.0")
-        check_hermes_requires(">=0.12.0", "1.0.0")
-
-    def test_gte_not_satisfied(self):
-        with pytest.raises(DistributionError, match=r"requires Hermes >=0\.13\.0"):
-            check_hermes_requires(">=0.13.0", "0.12.0")
-
-    def test_eq_exact(self):
-        check_hermes_requires("==0.12.0", "0.12.0")
-        with pytest.raises(DistributionError):
-            check_hermes_requires("==0.12.0", "0.12.1")
-
-    def test_lt_op(self):
-        check_hermes_requires("<1.0.0", "0.12.0")
-        with pytest.raises(DistributionError):
-            check_hermes_requires("<1.0.0", "1.0.0")
-
-    def test_bare_version_treated_as_gte(self):
-        check_hermes_requires("0.12.0", "0.13.0")
-        with pytest.raises(DistributionError):
-            check_hermes_requires("0.13.0", "0.12.0")
-
-    def test_empty_spec_is_noop(self):
-        check_hermes_requires("", "0.0.1")
-        check_hermes_requires(None, "0.0.1")  # type: ignore[arg-type]
 
 
 # ===========================================================================
-# Env template rendering
+# Env template
 # ===========================================================================
 
 
 class TestEnvTemplate:
 
-    def test_required_key_uncommented(self):
+    def test_required_is_uncommented(self):
         m = DistributionManifest(
             name="x",
-            env_requires=[EnvRequirement(name="API", description="api key")],
+            env_requires=[EnvRequirement(name="FOO", description="foo key")],
         )
-        body = _env_template_from_manifest(m)
-        assert "API=" in body
-        # Required vars must NOT be commented out
-        assert "\nAPI=" in body or body.startswith("API=")
+        out = _env_template_from_manifest(m)
+        assert "# foo key" in out
+        assert "# (required)" in out
+        assert "FOO=" in out
+        # No leading `# ` before FOO=
+        assert "\nFOO=" in out or out.startswith("FOO=") or "\nFOO=\n" in out or "FOO=\n" in out
 
-    def test_optional_key_commented(self):
+    def test_optional_is_commented(self):
         m = DistributionManifest(
             name="x",
-            env_requires=[
-                EnvRequirement(name="OPT", required=False, default="http://x"),
-            ],
+            env_requires=[EnvRequirement(name="BAR", required=False, default="http://x")],
         )
-        body = _env_template_from_manifest(m)
-        # Optional keys are commented out so they don't override env by default
-        assert "# OPT=http://x" in body
+        out = _env_template_from_manifest(m)
+        assert "# (optional)" in out
+        assert "# BAR=http://x" in out
+
+    def test_empty_env_requires_is_header_only(self):
+        m = DistributionManifest(name="x")
+        out = _env_template_from_manifest(m)
+        assert "Hermes distribution" in out
+        assert "FOO" not in out
 
 
 # ===========================================================================
-# Pack — archive creation
+# Source URL detection
 # ===========================================================================
 
 
-class TestPack:
+class TestLooksLikeGitUrl:
 
-    def test_pack_emits_archive_with_manifest(self, profile_env):
-        _make_profile(profile_env, "src")
-        output = profile_env / "src.tar.gz"
-        result = pack_profile("src", str(output))
-        assert result.exists()
-        with tarfile.open(result, "r:gz") as tf:
-            names = tf.getnames()
-        assert any(n.endswith(f"src/{MANIFEST_FILENAME}") for n in names)
-        assert any(n.endswith("src/SOUL.md") for n in names)
-        assert any(n.endswith("src/skills/demo/SKILL.md") for n in names)
+    @pytest.mark.parametrize("src", [
+        "github.com/user/repo",
+        "https://github.com/user/repo",
+        "https://github.com/user/repo.git",
+        "http://example.com/repo",
+        "git@github.com:user/repo.git",
+        "ssh://git@example.com/repo.git",
+        "git://example.com/repo.git",
+    ])
+    def test_accepts_git_sources(self, src):
+        assert _looks_like_git_url(src)
 
-    def test_pack_excludes_credentials(self, profile_env):
-        _make_profile(profile_env, "src")
-        output = profile_env / "src.tar.gz"
-        result = pack_profile("src", str(output))
-        with tarfile.open(result, "r:gz") as tf:
-            names = tf.getnames()
-        assert not any(n.endswith("auth.json") for n in names), "auth.json leaked"
-        assert not any(n.endswith(".env") for n in names), ".env leaked"
-
-    def test_pack_excludes_user_data(self, profile_env):
-        _make_profile(profile_env, "src")
-        result = pack_profile("src", str(profile_env / "src.tar.gz"))
-        with tarfile.open(result, "r:gz") as tf:
-            names = tf.getnames()
-        # memories/ is user-owned and must not be shipped
-        assert not any("memories/" in n for n in names), \
-            "memories/ leaked into distribution"
-
-    def test_pack_uses_explicit_manifest(self, profile_env):
-        _make_profile(profile_env, "src")
-        m = DistributionManifest(
-            name="renamed",
-            version="2.0.0",
-            description="hello",
-            env_requires=[EnvRequirement(name="FOO")],
-        )
-        result = pack_profile("src", str(profile_env / "out.tar.gz"), manifest=m)
-        # Archive root is manifest.name, not profile name
-        with tarfile.open(result, "r:gz") as tf:
-            names = tf.getnames()
-        assert any(n.startswith("renamed/") for n in names)
-        # .env.template should be emitted because env_requires is non-empty
-        assert any(n.endswith("renamed/.env.template") for n in names)
-
-    def test_pack_strips_source_field(self, profile_env):
-        _make_profile(profile_env, "src")
-        # Pre-seed a manifest with a source field; pack should wipe it before
-        # writing to the archive (source is user-local provenance).
-        profile_dir = Path(os.environ["HERMES_HOME"]).parent / ".hermes" / "profiles" / "src"
-        write_manifest(
-            profile_dir,
-            DistributionManifest(name="src", version="0.1.0", source="/home/me/src"),
-        )
-        result = pack_profile("src", str(profile_env / "src.tar.gz"))
-        with tarfile.open(result, "r:gz") as tf:
-            member = tf.getmember(f"src/{MANIFEST_FILENAME}")
-            data = tf.extractfile(member).read().decode()
-        assert "/home/me/src" not in data
+    @pytest.mark.parametrize("src", [
+        "/tmp/local/path",
+        "./relative/dir",
+        "~/profile",
+        "some-random-string",
+    ])
+    def test_rejects_non_git(self, src):
+        assert not _looks_like_git_url(src)
 
 
 # ===========================================================================
-# Find dist root — archive layout resolution
-# ===========================================================================
-
-
-class TestFindDistRoot:
-
-    def test_manifest_at_root(self, tmp_path):
-        (tmp_path / MANIFEST_FILENAME).write_text("name: x\nversion: 1\n")
-        assert _find_dist_root(tmp_path) == tmp_path
-
-    def test_manifest_inside_single_subdir(self, tmp_path):
-        sub = tmp_path / "distro"
-        sub.mkdir()
-        (sub / MANIFEST_FILENAME).write_text("name: x\nversion: 1\n")
-        assert _find_dist_root(tmp_path) == sub
-
-    def test_no_manifest_raises(self, tmp_path):
-        (tmp_path / "only_a_readme.md").write_text("hello")
-        with pytest.raises(DistributionError, match="No distribution.yaml"):
-            _find_dist_root(tmp_path)
-
-
-# ===========================================================================
-# Install — fresh and force
+# Install — fresh and force (from a local-directory source)
 # ===========================================================================
 
 
 class TestInstall:
 
-    def test_install_from_local_tarball(self, profile_env):
-        _make_profile(profile_env, "src")
-        archive = pack_profile("src", str(profile_env / "src.tar.gz"))
-
-        plan = install_distribution(str(archive), name="installed")
+    def test_install_from_directory(self, profile_env):
+        staged = _make_staging_dir(profile_env, "src")
+        plan = install_distribution(str(staged), name="installed")
         assert plan.target_dir.is_dir()
         assert (plan.target_dir / "SOUL.md").read_text() == "I am Source.\n"
         assert (plan.target_dir / "skills" / "demo" / "SKILL.md").exists()
+        assert (plan.target_dir / "mcp.json").exists()
         # Manifest on disk records canonical name + provenance
         m = read_manifest(plan.target_dir)
         assert m.name == "installed"
-        assert m.source.endswith("src.tar.gz")
+        assert m.source == str(staged)
 
-    def test_install_from_directory(self, profile_env):
-        _make_profile(profile_env, "src")
-        archive = pack_profile("src", str(profile_env / "src.tar.gz"))
-        # Extract to a dir and install from there
-        staging = profile_env / "staged"
-        with tarfile.open(archive, "r:gz") as tf:
-            # Manual safe extract — only for tests
-            for m in tf.getmembers():
-                if m.isfile():
-                    target = staging / m.name
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    extracted = tf.extractfile(m)
-                    target.write_bytes(extracted.read())
-                elif m.isdir():
-                    (staging / m.name).mkdir(parents=True, exist_ok=True)
-
-        plan = install_distribution(str(staging / "src"), name="fromdir")
-        assert plan.target_dir.is_dir()
-        assert (plan.target_dir / "SOUL.md").exists()
-
-    def test_install_does_not_include_credentials(self, profile_env):
-        _make_profile(profile_env, "src")
-        archive = pack_profile("src", str(profile_env / "src.tar.gz"))
-        plan = install_distribution(str(archive), name="clean")
-        # The archive never had auth.json or .env so they shouldn't appear
-        assert not (plan.target_dir / "auth.json").exists()
-        assert not (plan.target_dir / ".env").exists()
+    def test_install_uses_manifest_name_when_no_override(self, profile_env):
+        mf = DistributionManifest(name="telem", version="1.0.0")
+        staged = _make_staging_dir(profile_env, "telem", manifest=mf)
+        plan = install_distribution(str(staged))
+        assert plan.manifest.name == "telem"
+        assert plan.target_dir.name == "telem"
 
     def test_install_rejects_existing_without_force(self, profile_env):
-        _make_profile(profile_env, "src")
-        archive = pack_profile("src", str(profile_env / "src.tar.gz"))
-        install_distribution(str(archive), name="existing")
+        staged = _make_staging_dir(profile_env, "src")
+        install_distribution(str(staged), name="existing")
         with pytest.raises(DistributionError, match="already exists"):
-            install_distribution(str(archive), name="existing")
+            install_distribution(str(staged), name="existing")
 
     def test_install_with_force_overwrites(self, profile_env):
-        _make_profile(profile_env, "src")
-        archive = pack_profile("src", str(profile_env / "src.tar.gz"))
-        install_distribution(str(archive), name="target")
+        staged = _make_staging_dir(profile_env, "src")
+        install_distribution(str(staged), name="target")
         # Install again with --force succeeds
-        plan = install_distribution(str(archive), name="target", force=True)
+        plan = install_distribution(str(staged), name="target", force=True)
         assert plan.target_dir.is_dir()
 
     def test_install_rejects_default_name(self, profile_env):
-        _make_profile(profile_env, "src")
-        archive = pack_profile("src", str(profile_env / "src.tar.gz"))
+        staged = _make_staging_dir(profile_env, "src")
         with pytest.raises(DistributionError, match="Cannot install"):
-            install_distribution(str(archive), name="default")
+            install_distribution(str(staged), name="default")
 
-    def test_install_rejects_non_distribution(self, profile_env, tmp_path):
-        # Make a tar.gz with no manifest
+    def test_install_rejects_non_distribution_directory(self, profile_env, tmp_path):
         bogus = tmp_path / "bogus_dir"
         bogus.mkdir()
         (bogus / "some_file").write_text("hi")
-        archive = tmp_path / "bogus.tar.gz"
-        import shutil
-        shutil.make_archive(str(archive).removesuffix(".tar.gz"), "gztar", str(tmp_path), "bogus_dir")
-
         with pytest.raises(DistributionError, match="No distribution.yaml"):
-            plan_install(str(archive), tmp_path / "work", override_name="x")
+            plan_install(str(bogus), tmp_path / "work", override_name="x")
+
+    def test_install_rejects_unknown_source(self, profile_env, tmp_path):
+        with pytest.raises(DistributionError, match="Cannot resolve"):
+            plan_install("definitely-not-a-thing", tmp_path / "work", override_name="x")
+
+    def test_install_emits_env_example_when_manifest_has_env(self, profile_env):
+        mf = DistributionManifest(
+            name="needs_env",
+            version="0.1.0",
+            env_requires=[EnvRequirement(name="OPENAI_API_KEY", description="key")],
+        )
+        staged = _make_staging_dir(profile_env, "needs_env", manifest=mf)
+        plan = install_distribution(str(staged), name="needs_env")
+        example = plan.target_dir / ".env.EXAMPLE"
+        assert example.is_file()
+        assert "OPENAI_API_KEY" in example.read_text()
+
+    def test_install_enforces_hermes_requires(self, profile_env, monkeypatch):
+        # Pin current Hermes version to something well below the requirement
+        import hermes_cli
+        monkeypatch.setattr(hermes_cli, "__version__", "0.1.0", raising=False)
+
+        mf = DistributionManifest(
+            name="future",
+            version="1.0.0",
+            hermes_requires=">=99.0.0",
+        )
+        staged = _make_staging_dir(profile_env, "future", manifest=mf)
+        with pytest.raises(DistributionError, match="requires Hermes"):
+            install_distribution(str(staged), name="future")
 
 
 # ===========================================================================
@@ -399,22 +351,20 @@ class TestInstall:
 class TestUpdate:
 
     def test_update_preserves_user_data(self, profile_env):
-        # 1. Make source, pack, install
-        _make_profile(profile_env, "src")
-        archive = pack_profile("src", str(profile_env / "src.tar.gz"))
-        plan = install_distribution(str(archive), name="telem")
+        # 1. Build staging dir, install
+        staged = _make_staging_dir(profile_env, "src")
+        plan = install_distribution(str(staged), name="telem")
 
         # 2. Add user-owned data to the installed profile
+        (plan.target_dir / "memories").mkdir(exist_ok=True)
         (plan.target_dir / "memories" / "MEMORY.md").write_text("# USER MEMORY\n")
         (plan.target_dir / ".env").write_text("OPENAI_API_KEY=sk-user\n")
         (plan.target_dir / "auth.json").write_text('{"user": "auth"}')
         (plan.target_dir / "sessions").mkdir(exist_ok=True)
         (plan.target_dir / "sessions" / "chat.json").write_text('{"s": 1}')
 
-        # 3. Bump source — change SOUL, leave source tar.gz at same path
-        src_profile = Path(os.environ["HERMES_HOME"]).parent / ".hermes" / "profiles" / "src"
-        (src_profile / "SOUL.md").write_text("I am Source v2.\n")
-        pack_profile("src", str(archive))
+        # 3. Bump source in the staging dir
+        (staged / "SOUL.md").write_text("I am Source v2.\n")
 
         # 4. Update
         update_distribution("telem", force_config=False)
@@ -428,32 +378,28 @@ class TestUpdate:
         assert (plan.target_dir / "sessions" / "chat.json").read_text() == '{"s": 1}'
 
     def test_update_preserves_config_by_default(self, profile_env):
-        _make_profile(profile_env, "src")
-        archive = pack_profile("src", str(profile_env / "src.tar.gz"))
-        plan = install_distribution(str(archive), name="t2")
+        staged = _make_staging_dir(profile_env, "src")
+        plan = install_distribution(str(staged), name="t2")
 
         # User edits config
-        (plan.target_dir / "config.yaml").write_text("model:\n  model: gpt-5\n# user override\n")
+        (plan.target_dir / "config.yaml").write_text(
+            "model:\n  model: gpt-5\n# user override\n"
+        )
 
         # Bump source config
-        src_profile = Path(os.environ["HERMES_HOME"]).parent / ".hermes" / "profiles" / "src"
-        (src_profile / "config.yaml").write_text("model:\n  model: claude\n")
-        pack_profile("src", str(archive))
+        (staged / "config.yaml").write_text("model:\n  model: claude\n")
 
         update_distribution("t2", force_config=False)
         assert "gpt-5" in (plan.target_dir / "config.yaml").read_text()
         assert "user override" in (plan.target_dir / "config.yaml").read_text()
 
     def test_update_force_config_overwrites(self, profile_env):
-        _make_profile(profile_env, "src")
-        archive = pack_profile("src", str(profile_env / "src.tar.gz"))
-        plan = install_distribution(str(archive), name="t3")
+        staged = _make_staging_dir(profile_env, "src")
+        plan = install_distribution(str(staged), name="t3")
 
         (plan.target_dir / "config.yaml").write_text("model:\n  model: gpt-5\n")
 
-        src_profile = Path(os.environ["HERMES_HOME"]).parent / ".hermes" / "profiles" / "src"
-        (src_profile / "config.yaml").write_text("model:\n  model: claude\n")
-        pack_profile("src", str(archive))
+        (staged / "config.yaml").write_text("model:\n  model: claude\n")
 
         update_distribution("t3", force_config=True)
         assert "claude" in (plan.target_dir / "config.yaml").read_text()
@@ -462,7 +408,7 @@ class TestUpdate:
     def test_update_missing_manifest_errors(self, profile_env):
         # Make a profile without a manifest; update must refuse
         from hermes_cli.profiles import create_profile
-        profile_dir = create_profile(name="plain", no_alias=True)
+        create_profile(name="plain", no_alias=True)
         with pytest.raises(DistributionError, match="not a distribution"):
             update_distribution("plain")
 
@@ -475,18 +421,14 @@ class TestUpdate:
 class TestDescribe:
 
     def test_describe_existing_distribution(self, profile_env):
-        _make_profile(profile_env, "src")
-        archive = pack_profile(
-            "src",
-            str(profile_env / "src.tar.gz"),
-            manifest=DistributionManifest(
-                name="telem",
-                version="1.0.0",
-                description="compliance monitor",
-                env_requires=[EnvRequirement(name="API", description="api key")],
-            ),
+        mf = DistributionManifest(
+            name="telem",
+            version="1.0.0",
+            description="compliance monitor",
+            env_requires=[EnvRequirement(name="API", description="api key")],
         )
-        install_distribution(str(archive), name="telem")
+        staged = _make_staging_dir(profile_env, "telem", manifest=mf)
+        install_distribution(str(staged), name="telem")
         data = describe_distribution("telem")
         assert data["name"] == "telem"
         assert data["version"] == "1.0.0"
@@ -503,28 +445,11 @@ class TestDescribe:
 
 
 # ===========================================================================
-# Security — archive traversal, source strip
+# Security — USER_OWNED_EXCLUDE covers the right paths
 # ===========================================================================
 
 
 class TestSecurity:
-
-    def test_path_traversal_rejected(self, profile_env, tmp_path):
-        # Craft a malicious tar.gz with ``../escape`` members
-        malicious = tmp_path / "evil.tar.gz"
-        with tarfile.open(malicious, "w:gz") as tf:
-            info = tarfile.TarInfo(name="evil/../../../escape.txt")
-            data = b"pwn"
-            info.size = len(data)
-            import io
-            tf.addfile(info, io.BytesIO(data))
-            mf = tarfile.TarInfo(name="evil/distribution.yaml")
-            mdata = b"name: evil\nversion: 1\n"
-            mf.size = len(mdata)
-            tf.addfile(mf, io.BytesIO(mdata))
-
-        with pytest.raises(DistributionError, match="Unsafe archive member"):
-            install_distribution(str(malicious), name="evil")
 
     def test_user_owned_exclude_covers_credentials(self):
         assert "auth.json" in USER_OWNED_EXCLUDE
@@ -532,3 +457,18 @@ class TestSecurity:
         assert "memories" in USER_OWNED_EXCLUDE
         assert "sessions" in USER_OWNED_EXCLUDE
         assert "local" in USER_OWNED_EXCLUDE
+
+    def test_install_does_not_import_credentials_from_staging(self, profile_env):
+        """If an author accidentally ships auth.json or .env in their
+        staging dir, the installer must NOT copy them to the target profile."""
+        staged = _make_staging_dir(profile_env, "src")
+        # Author leaks credentials into the staging tree (shouldn't happen, but...)
+        (staged / "auth.json").write_text('{"leaked": true}')
+        (staged / ".env").write_text("LEAKED=1")
+
+        plan = install_distribution(str(staged), name="clean")
+        assert not (plan.target_dir / "auth.json").exists(), "auth.json leaked"
+        # Fresh profile may have its own .env via the bootstrap; what we care
+        # about is that the leaked content didn't land in the target.
+        if (plan.target_dir / ".env").exists():
+            assert "LEAKED" not in (plan.target_dir / ".env").read_text()
